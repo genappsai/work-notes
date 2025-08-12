@@ -310,3 +310,198 @@ If you want, I can now:
 
 Which one should I build next?
 
+
+Got it — you basically want to turn the simple ShedLock scheduler into a **multi-tenant, self-service workflow scheduling service** that supports:
+
+1. **Cron scheduling** (recurring)
+2. **One-time scheduling** (future date/time)
+3. **Validation** of cron expressions on creation
+4. **maxConcurrentRuns** enforcement (prevent overlapping runs for the same schedule)
+5. **Namespace / ownership** (so tenants don’t collide on schedules)
+6. **Still works across multiple pods** (distributed lock)
+
+Here’s a clean redesign plan + implementation outline.
+
+---
+
+## **1. Data Model**
+
+We’ll store schedules in a DB table.
+This is the **single source of truth** for all pods.
+
+```sql
+CREATE TABLE workflow_schedules (
+    id UUID PRIMARY KEY,
+    namespace VARCHAR(100) NOT NULL,
+    workflow_name VARCHAR(200) NOT NULL,
+    workflow_version INT NOT NULL,
+    schedule_type VARCHAR(20) NOT NULL, -- CRON or ONCE
+    cron_expression VARCHAR(100),       -- only if type=CRON
+    run_at TIMESTAMP WITH TIME ZONE,    -- only if type=ONCE
+    max_concurrent_runs INT DEFAULT 1,
+    last_triggered_at TIMESTAMP WITH TIME ZONE,
+    status VARCHAR(20) DEFAULT 'ACTIVE', -- ACTIVE, PAUSED, DISABLED
+    created_by VARCHAR(100) NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT now()
+);
+```
+
+---
+
+## **2. Workflow Scheduling API**
+
+### **Create Schedule**
+
+* Validates cron expressions if `type=CRON` using `CronExpression.parse(cron)`.
+* Validates `run_at` if `type=ONCE` is in the future.
+* Checks `maxConcurrentRuns` ≥ 1.
+* Assigns namespace from the authenticated user’s tenant.
+
+Example DTO:
+
+```java
+public record CreateScheduleRequest(
+    String namespace,
+    String workflowName,
+    int workflowVersion,
+    ScheduleType scheduleType,
+    String cronExpression, // nullable
+    Instant runAt,         // nullable
+    int maxConcurrentRuns
+) {}
+```
+
+---
+
+## **3. Scheduler Execution Logic**
+
+We’ll have **one** scheduler thread in the cluster (thanks to ShedLock) scanning the DB every minute for:
+
+* **CRON schedules** due now (based on `last_triggered_at` + cron next execution time).
+* **ONCE schedules** with `run_at <= now()` and not yet executed.
+
+For **maxConcurrentRuns**:
+
+* Before triggering, check how many active runs exist for `(namespace, workflow_name)`.
+* If that count ≥ maxConcurrentRuns, skip until next interval.
+
+---
+
+## **4. Code Outline**
+
+### **Cron validation on creation**
+
+```java
+import org.springframework.scheduling.support.CronExpression;
+
+public void validateSchedule(CreateScheduleRequest req) {
+    if (req.scheduleType() == ScheduleType.CRON) {
+        try {
+            CronExpression.parse(req.cronExpression());
+        } catch (Exception e) {
+            throw new IllegalArgumentException("Invalid cron expression: " + req.cronExpression());
+        }
+    } else if (req.scheduleType() == ScheduleType.ONCE) {
+        if (req.runAt().isBefore(Instant.now())) {
+            throw new IllegalArgumentException("runAt must be in the future");
+        }
+    }
+    if (req.maxConcurrentRuns() < 1) {
+        throw new IllegalArgumentException("maxConcurrentRuns must be >= 1");
+    }
+}
+```
+
+---
+
+### **Scheduled job with ShedLock**
+
+```java
+import net.javacrumbs.shedlock.spring.annotation.SchedulerLock;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Service;
+import java.time.Instant;
+import java.util.List;
+
+@Service
+public class DistributedScheduleExecutor {
+
+    private final ScheduleRepository repo;
+    private final ConductorClient conductor;
+
+    public DistributedScheduleExecutor(ScheduleRepository repo, ConductorClient conductor) {
+        this.repo = repo;
+        this.conductor = conductor;
+    }
+
+    @Scheduled(fixedDelay = 60000) // every 60s
+    @SchedulerLock(name = "schedule-executor", lockAtLeastFor = "PT50S", lockAtMostFor = "PT1M")
+    public void executeDueSchedules() {
+        Instant now = Instant.now();
+
+        List<WorkflowSchedule> due = repo.findDueSchedules(now);
+        for (WorkflowSchedule sched : due) {
+            if (canTrigger(sched)) {
+                conductor.startWorkflow(sched);
+                repo.updateLastTriggered(sched.getId(), now);
+            }
+        }
+    }
+
+    private boolean canTrigger(WorkflowSchedule sched) {
+        // Check maxConcurrentRuns
+        int activeRuns = conductor.countActiveRuns(sched.getNamespace(), sched.getWorkflowName());
+        return activeRuns < sched.getMaxConcurrentRuns();
+    }
+}
+```
+
+---
+
+### **Repository Query for Due Schedules**
+
+```sql
+-- For CRON schedules:
+SELECT * FROM workflow_schedules
+WHERE status = 'ACTIVE'
+  AND schedule_type = 'CRON'
+  AND next_run_time <= now();
+
+-- For ONCE schedules:
+SELECT * FROM workflow_schedules
+WHERE status = 'ACTIVE'
+  AND schedule_type = 'ONCE'
+  AND run_at <= now()
+  AND last_triggered_at IS NULL;
+```
+
+(`next_run_time` can be precomputed on each trigger, or calculated in Java via `CronExpression.next()`.)
+
+---
+
+### **Multi-tenancy / Namespace Isolation**
+
+* All queries include `WHERE namespace = :namespace` unless you’re an admin.
+* Lock key in ShedLock can include namespace if you want per-namespace scheduling (`name = "schedule-executor-" + namespace`), but for most cases one cluster-wide scheduler is fine.
+
+---
+
+## **5. Benefits**
+
+* **Distributed safe** — ShedLock prevents duplicate triggers across pods.
+* **Multi-tenant** — Namespace ensures isolation.
+* **No overlaps** — `maxConcurrentRuns` prevents concurrency overflow.
+* **Self-service** — New schedules can be added via API, without restarting service.
+* **Future-proof** — Can later replace DB with Redis, DynamoDB, etc.
+
+---
+
+If you want, I can turn this into:
+
+* A **full Spring Boot service** with REST APIs (`/schedules`)
+* A **flyway migration** for the table
+* A working **K8s manifest** with multiple pods
+* An example **Postman collection** for creating/testing schedules
+
+Do you want me to go ahead and produce that complete runnable service? That way both cron and one-time scheduling will be ready to deploy.
+
