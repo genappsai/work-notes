@@ -505,3 +505,644 @@ If you want, I can turn this into:
 
 Do you want me to go ahead and produce that complete runnable service? That way both cron and one-time scheduling will be ready to deploy.
 
+
+
+// Project: conductor-scheduler-springboot
+// Structure: Maven project. Below are the key files you can copy into a project.
+
+=== pom.xml ===
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+    <groupId>com.example</groupId>
+    <artifactId>conductor-scheduler</artifactId>
+    <version>0.0.1-SNAPSHOT</version>
+    <packaging>jar</packaging>
+
+    <properties>
+        <java.version>17</java.version>
+        <spring-boot.version>3.1.4</spring-boot.version>
+        <shedlock.version>4.45.0</shedlock.version>
+    </properties>
+
+    <dependencyManagement>
+        <dependencies>
+            <dependency>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-dependencies</artifactId>
+                <version>${spring-boot.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+
+    <dependencies>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-jpa</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-jdbc</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.postgresql</groupId>
+            <artifactId>postgresql</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>net.javacrumbs.shedlock</groupId>
+            <artifactId>shedlock-spring</artifactId>
+            <version>${shedlock.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>net.javacrumbs.shedlock</groupId>
+            <artifactId>shedlock-provider-jdbc-template</artifactId>
+            <version>${shedlock.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.flywaydb</groupId>
+            <artifactId>flyway-core</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-actuator</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-validation</artifactId>
+        </dependency>
+        <!-- Test -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+            </plugin>
+        </plugins>
+    </build>
+</project>
+
+=== src/main/resources/application.yml ===
+spring:
+  datasource:
+    url: jdbc:postgresql://localhost:5432/schedulerdb
+    username: scheduler
+    password: scheduler
+    driver-class-name: org.postgresql.Driver
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    properties:
+      hibernate:
+        jdbc:
+          time_zone: UTC
+
+server:
+  port: 8080
+
+scheduler:
+  poll-interval-ms: 30000
+  page-size: 50
+
+conductor:
+  url: http://localhost:8080
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: "health,info"
+
+=== src/main/resources/db/migration/V1__create_scheduler_tables.sql ===
+-- create workflow schedules
+CREATE TABLE IF NOT EXISTS workflow_schedules (
+  id UUID PRIMARY KEY,
+  namespace VARCHAR(100) NOT NULL,
+  name VARCHAR(200),
+  workflow_name VARCHAR(200) NOT NULL,
+  workflow_version INT NOT NULL DEFAULT 1,
+  schedule_type VARCHAR(20) NOT NULL,
+  cron_expression VARCHAR(200),
+  run_at TIMESTAMPTZ,
+  next_run TIMESTAMPTZ NOT NULL,
+  max_concurrent_runs INT NOT NULL DEFAULT 1,
+  last_triggered_at TIMESTAMPTZ,
+  status VARCHAR(20) NOT NULL DEFAULT 'ACTIVE',
+  created_by VARCHAR(100) NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- history
+CREATE TABLE IF NOT EXISTS schedule_history (
+  id UUID PRIMARY KEY,
+  schedule_id UUID REFERENCES workflow_schedules(id),
+  run_at TIMESTAMPTZ NOT NULL,
+  status VARCHAR(20),
+  response JSONB,
+  error_message TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- ShedLock table
+CREATE TABLE IF NOT EXISTS shedlock(
+    name VARCHAR(64) NOT NULL PRIMARY KEY,
+    lock_until TIMESTAMPTZ NOT NULL,
+    locked_at TIMESTAMPTZ NOT NULL,
+    locked_by VARCHAR(255) NOT NULL
+);
+
+=== src/main/java/com/example/scheduler/SchedulerApplication.java ===
+package com.example.scheduler;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.scheduling.annotation.EnableScheduling;
+import net.javacrumbs.shedlock.spring.annotation.EnableSchedulerLock;
+
+@SpringBootApplication
+@EnableScheduling
+@EnableSchedulerLock(defaultLockAtMostFor = "PT5M")
+public class SchedulerApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(SchedulerApplication.class, args);
+    }
+}
+
+=== src/main/java/com/example/scheduler/config/ShedLockConfig.java ===
+package com.example.scheduler.config;
+
+import javax.sql.DataSource;
+
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.jdbc.core.JdbcTemplate;
+
+import net.javacrumbs.shedlock.core.LockProvider;
+import net.javacrumbs.shedlock.provider.jdbctemplate.JdbcTemplateLockProvider;
+
+@Configuration
+public class ShedLockConfig {
+
+    @Bean
+    public LockProvider lockProvider(DataSource dataSource) {
+        return new JdbcTemplateLockProvider(
+            JdbcTemplateLockProvider.Configuration.builder()
+                .withJdbcTemplate(new JdbcTemplate(dataSource))
+                .usingDbTime() // use DB time
+                .build()
+        );
+    }
+}
+
+=== src/main/java/com/example/scheduler/model/Schedule.java ===
+package com.example.scheduler.model;
+
+import jakarta.persistence.*;
+import java.time.Instant;
+import java.util.UUID;
+
+@Entity
+@Table(name = "workflow_schedules")
+public class Schedule {
+    @Id
+    private UUID id;
+    private String namespace;
+    private String name;
+    private String workflowName;
+    private Integer workflowVersion;
+    private String scheduleType; // CRON or ONCE
+    private String cronExpression;
+    private Instant runAt;
+    private Instant nextRun;
+    private Integer maxConcurrentRuns;
+    private Instant lastTriggeredAt;
+    private String status;
+    private String createdBy;
+    private Instant createdAt;
+
+    // getters/setters
+    // ... (omitted for brevity in the canvas view)
+
+    public Schedule() {}
+
+    // getters and setters generated below
+    public UUID getId() { return id; }
+    public void setId(UUID id) { this.id = id; }
+    public String getNamespace() { return namespace; }
+    public void setNamespace(String namespace) { this.namespace = namespace; }
+    public String getName() { return name; }
+    public void setName(String name) { this.name = name; }
+    public String getWorkflowName() { return workflowName; }
+    public void setWorkflowName(String workflowName) { this.workflowName = workflowName; }
+    public Integer getWorkflowVersion() { return workflowVersion; }
+    public void setWorkflowVersion(Integer workflowVersion) { this.workflowVersion = workflowVersion; }
+    public String getScheduleType() { return scheduleType; }
+    public void setScheduleType(String scheduleType) { this.scheduleType = scheduleType; }
+    public String getCronExpression() { return cronExpression; }
+    public void setCronExpression(String cronExpression) { this.cronExpression = cronExpression; }
+    public Instant getRunAt() { return runAt; }
+    public void setRunAt(Instant runAt) { this.runAt = runAt; }
+    public Instant getNextRun() { return nextRun; }
+    public void setNextRun(Instant nextRun) { this.nextRun = nextRun; }
+    public Integer getMaxConcurrentRuns() { return maxConcurrentRuns; }
+    public void setMaxConcurrentRuns(Integer maxConcurrentRuns) { this.maxConcurrentRuns = maxConcurrentRuns; }
+    public Instant getLastTriggeredAt() { return lastTriggeredAt; }
+    public void setLastTriggeredAt(Instant lastTriggeredAt) { this.lastTriggeredAt = lastTriggeredAt; }
+    public String getStatus() { return status; }
+    public void setStatus(String status) { this.status = status; }
+    public String getCreatedBy() { return createdBy; }
+    public void setCreatedBy(String createdBy) { this.createdBy = createdBy; }
+    public Instant getCreatedAt() { return createdAt; }
+    public void setCreatedAt(Instant createdAt) { this.createdAt = createdAt; }
+}
+
+=== src/main/java/com/example/scheduler/repository/ScheduleRepository.java ===
+package com.example.scheduler.repository;
+
+import com.example.scheduler.model.Schedule;
+import org.springframework.data.domain.Pageable;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
+
+import java.time.Instant;
+import java.util.List;
+import java.util.UUID;
+
+public interface ScheduleRepository extends JpaRepository<Schedule, UUID> {
+
+    @Query("SELECT s FROM Schedule s WHERE s.status = 'ACTIVE' AND s.nextRun <= :now ORDER BY s.nextRun ASC")
+    List<Schedule> findDueSchedules(@Param("now") Instant now, Pageable pageable);
+}
+
+=== src/main/java/com/example/scheduler/repository/ScheduleHistoryRepository.java ===
+package com.example.scheduler.repository;
+
+import com.example.scheduler.model.ScheduleHistory;
+import org.springframework.data.jpa.repository.JpaRepository;
+
+import java.util.UUID;
+
+public interface ScheduleHistoryRepository extends JpaRepository<ScheduleHistory, UUID> {
+}
+
+=== src/main/java/com/example/scheduler/model/ScheduleHistory.java ===
+package com.example.scheduler.model;
+
+import jakarta.persistence.*;
+import java.time.Instant;
+import java.util.UUID;
+
+@Entity
+@Table(name = "schedule_history")
+public class ScheduleHistory {
+    @Id
+    private UUID id;
+    private UUID scheduleId;
+    private Instant runAt;
+    private String status;
+    @Column(columnDefinition = "jsonb")
+    private String response;
+    private String errorMessage;
+    private Instant createdAt;
+
+    public ScheduleHistory() {}
+    // getters/setters omitted for brevity
+}
+
+=== src/main/java/com/example/scheduler/dto/CreateScheduleRequest.java ===
+package com.example.scheduler.dto;
+
+import jakarta.validation.constraints.Min;
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.NotNull;
+import java.time.Instant;
+
+public class CreateScheduleRequest {
+    @NotBlank
+    private String namespace;
+    @NotBlank
+    private String workflowName;
+    private Integer workflowVersion = 1;
+    @NotNull
+    private String scheduleType; // CRON or ONCE
+    private String cronExpression;
+    private Instant runAt;
+    @Min(1)
+    private Integer maxConcurrentRuns = 1;
+    private String createdBy;
+
+    // getters/setters
+    public String getNamespace() { return namespace; }
+    public void setNamespace(String namespace) { this.namespace = namespace; }
+    public String getWorkflowName() { return workflowName; }
+    public void setWorkflowName(String workflowName) { this.workflowName = workflowName; }
+    public Integer getWorkflowVersion() { return workflowVersion; }
+    public void setWorkflowVersion(Integer workflowVersion) { this.workflowVersion = workflowVersion; }
+    public String getScheduleType() { return scheduleType; }
+    public void setScheduleType(String scheduleType) { this.scheduleType = scheduleType; }
+    public String getCronExpression() { return cronExpression; }
+    public void setCronExpression(String cronExpression) { this.cronExpression = cronExpression; }
+    public Instant getRunAt() { return runAt; }
+    public void setRunAt(Instant runAt) { this.runAt = runAt; }
+    public Integer getMaxConcurrentRuns() { return maxConcurrentRuns; }
+    public void setMaxConcurrentRuns(Integer maxConcurrentRuns) { this.maxConcurrentRuns = maxConcurrentRuns; }
+    public String getCreatedBy() { return createdBy; }
+    public void setCreatedBy(String createdBy) { this.createdBy = createdBy; }
+}
+
+=== src/main/java/com/example/scheduler/controller/ScheduleController.java ===
+package com.example.scheduler.controller;
+
+import com.example.scheduler.dto.CreateScheduleRequest;
+import com.example.scheduler.model.Schedule;
+import com.example.scheduler.repository.ScheduleRepository;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+import jakarta.validation.Valid;
+import java.time.Instant;
+import java.util.UUID;
+
+@RestController
+@RequestMapping("/api/schedules")
+public class ScheduleController {
+    private final ScheduleRepository repo;
+
+    public ScheduleController(ScheduleRepository repo) {
+        this.repo = repo;
+    }
+
+    @PostMapping
+    public ResponseEntity<?> createSchedule(@RequestBody @Valid CreateScheduleRequest req) {
+        // minimal validation occurs in service layer; for brevity do a few checks here
+        Schedule s = new Schedule();
+        s.setId(UUID.randomUUID());
+        s.setNamespace(req.getNamespace());
+        s.setName(req.getNamespace() + ":" + req.getWorkflowName());
+        s.setWorkflowName(req.getWorkflowName());
+        s.setWorkflowVersion(req.getWorkflowVersion());
+        s.setScheduleType(req.getScheduleType());
+        s.setCronExpression(req.getCronExpression());
+        s.setRunAt(req.getRunAt());
+        s.setMaxConcurrentRuns(req.getMaxConcurrentRuns());
+        s.setStatus("ACTIVE");
+        s.setCreatedBy(req.getCreatedBy() == null ? "system" : req.getCreatedBy());
+        s.setCreatedAt(Instant.now());
+
+        // compute initial nextRun
+        Instant nextRun = computeInitialNextRun(s);
+        s.setNextRun(nextRun);
+
+        repo.save(s);
+        return ResponseEntity.ok(s);
+    }
+
+    private Instant computeInitialNextRun(Schedule s) {
+        Instant now = Instant.now();
+        if ("CRON".equalsIgnoreCase(s.getScheduleType())) {
+            if (s.getCronExpression() == null) throw new IllegalArgumentException("cronExpression required");
+            try {
+                var cron = org.springframework.scheduling.support.CronExpression.parse(s.getCronExpression());
+                var next = cron.next(java.time.ZonedDateTime.ofInstant(now, java.time.ZoneOffset.UTC));
+                return next.toInstant();
+            } catch (Exception e) {
+                throw new IllegalArgumentException("Invalid cron expression: " + e.getMessage());
+            }
+        } else {
+            if (s.getRunAt() == null) throw new IllegalArgumentException("runAt required for ONCE");
+            if (s.getRunAt().isBefore(now)) throw new IllegalArgumentException("runAt must be in the future");
+            return s.getRunAt();
+        }
+    }
+
+    @GetMapping
+    public ResponseEntity<?> list(@RequestParam(defaultValue = "0") int page,
+                                  @RequestParam(defaultValue = "50") int size) {
+        var p = repo.findAll(PageRequest.of(page, size));
+        return ResponseEntity.ok(p);
+    }
+}
+
+=== src/main/java/com/example/scheduler/service/ConductorClient.java ===
+package com.example.scheduler.service;
+
+import org.springframework.http.*;
+import org.springframework.stereotype.Component;
+import org.springframework.web.client.RestTemplate;
+
+import java.util.Map;
+
+@Component
+public class ConductorClient {
+    private final RestTemplate rest = new RestTemplate();
+    private final String baseUrl;
+
+    public ConductorClient(org.springframework.core.env.Environment env) {
+        this.baseUrl = env.getProperty("conductor.url", "http://localhost:8080");
+    }
+
+    public String startWorkflow(String name, int version, Map<String, Object> input) {
+        String url = baseUrl + "/workflow"; // adjust if your conductor uses /api/workflow
+        Map<String, Object> body = Map.of(
+            "name", name,
+            "version", version,
+            "input", input
+        );
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentType(MediaType.APPLICATION_JSON);
+        HttpEntity<Map<String, Object>> req = new HttpEntity<>(body, headers);
+        ResponseEntity<String> resp = rest.postForEntity(url, req, String.class);
+        return resp.getBody();
+    }
+
+    // stub for counting active runs; in real system you would call Conductor API
+    public int countActiveRuns(String namespace, String workflowName) {
+        // TODO: implement via conductor query API; returning 0 for now
+        return 0;
+    }
+}
+
+=== src/main/java/com/example/scheduler/service/ScheduleExecutor.java ===
+package com.example.scheduler.service;
+
+import com.example.scheduler.model.Schedule;
+import com.example.scheduler.model.ScheduleHistory;
+import com.example.scheduler.repository.ScheduleHistoryRepository;
+import com.example.scheduler.repository.ScheduleRepository;
+import net.javacrumbs.shedlock.spring.annotation.SchedulerLock;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Service;
+
+import java.time.Instant;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+
+@Service
+public class ScheduleExecutor {
+    private final ScheduleRepository repo;
+    private final ScheduleHistoryRepository historyRepo;
+    private final ConductorClient conductor;
+
+    public ScheduleExecutor(ScheduleRepository repo, ScheduleHistoryRepository historyRepo, ConductorClient conductor) {
+        this.repo = repo;
+        this.historyRepo = historyRepo;
+        this.conductor = conductor;
+    }
+
+    @Scheduled(fixedDelayString = "${scheduler.poll-interval-ms:30000}")
+    @SchedulerLock(name = "schedule-executor", lockAtMostFor = "PT2M", lockAtLeastFor = "PT1S")
+    public void pollAndExecute() {
+        Instant now = Instant.now();
+        int page = 0;
+        int size = Integer.parseInt(System.getProperty("scheduler.page-size", "50"));
+        List<Schedule> due;
+        do {
+            due = repo.findDueSchedules(now, PageRequest.of(page, size));
+            for (Schedule s : due) {
+                try {
+                    if (!canTrigger(s)) {
+                        // skip for now
+                        continue;
+                    }
+                    // start workflow
+                    String resp = conductor.startWorkflow(s.getWorkflowName(), s.getWorkflowVersion(), Map.of("scheduledBy", s.getId().toString()));
+
+                    // record history
+                    ScheduleHistory h = new ScheduleHistory();
+                    h.setId(UUID.randomUUID());
+                    h.setScheduleId(s.getId());
+                    h.setRunAt(now);
+                    h.setStatus("SUCCESS");
+                    h.setResponse(resp);
+                    h.setCreatedAt(Instant.now());
+                    historyRepo.save(h);
+
+                    // update schedule nextRun or disable
+                    if ("CRON".equalsIgnoreCase(s.getScheduleType())) {
+                        var cron = org.springframework.scheduling.support.CronExpression.parse(s.getCronExpression());
+                        var next = cron.next(java.time.ZonedDateTime.ofInstant(now, java.time.ZoneOffset.UTC));
+                        s.setNextRun(next.toInstant());
+                        s.setLastTriggeredAt(now);
+                        repo.save(s);
+                    } else {
+                        s.setStatus("DISABLED");
+                        s.setLastTriggeredAt(now);
+                        repo.save(s);
+                    }
+                } catch (Exception ex) {
+                    ScheduleHistory h = new ScheduleHistory();
+                    h.setId(UUID.randomUUID());
+                    h.setScheduleId(s.getId());
+                    h.setRunAt(now);
+                    h.setStatus("FAILED");
+                    h.setErrorMessage(ex.getMessage());
+                    h.setCreatedAt(Instant.now());
+                    historyRepo.save(h);
+                    // do not advance next_run for retries; will be retried on next poll
+                }
+            }
+            page++;
+        } while (!due.isEmpty());
+    }
+
+    private boolean canTrigger(Schedule s) {
+        int active = conductor.countActiveRuns(s.getNamespace(), s.getWorkflowName());
+        return active < s.getMaxConcurrentRuns();
+    }
+}
+
+=== src/main/java/com/example/scheduler/model/README_NOTE.txt ===
+// Note: Some model classes trim getters/setters in this canvas to reduce verbosity.
+// Copy getters/setters into real files as needed.
+
+=== Dockerfile ===
+FROM eclipse-temurin:17-jdk-alpine
+ARG JAR_FILE=target/conductor-scheduler-0.0.1-SNAPSHOT.jar
+COPY ${JAR_FILE} /app/app.jar
+ENTRYPOINT ["java","-jar","/app/app.jar"]
+
+=== k8s/deployment.yaml ===
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: conductor-scheduler
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: conductor-scheduler
+  template:
+    metadata:
+      labels:
+        app: conductor-scheduler
+    spec:
+      containers:
+      - name: app
+        image: yourrepo/conductor-scheduler:latest
+        env:
+        - name: SPRING_DATASOURCE_URL
+          value: jdbc:postgresql://postgres:5432/schedulerdb
+        - name: SPRING_DATASOURCE_USERNAME
+          valueFrom:
+            secretKeyRef:
+              name: db-secret
+              key: username
+        - name: SPRING_DATASOURCE_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: db-secret
+              key: password
+        - name: CONDUCTOR_URL
+          value: http://conductor:8080
+        readinessProbe:
+          httpGet:
+            path: /actuator/health/readiness
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 10
+
+=== README.md ===
+# Conductor Scheduler (Spring Boot)
+
+This is a minimal scheduler for triggering Conductor workflows. It supports:
+- Cron-based schedules
+- One-time schedules
+- Multi-pod safe execution using ShedLock + Postgres
+- maxConcurrentRuns enforcement (checking active runs via Conductor client stub)
+- Namespaces / multi-tenancy metadata
+
+## Run locally
+1. Start Postgres and create database `schedulerdb` with user `scheduler`.
+2. Adjust `src/main/resources/application.yml` for DB credentials.
+3. Build: `mvn -DskipTests package`
+4. Run: `java -jar target/conductor-scheduler-0.0.1-SNAPSHOT.jar`
+
+## Next steps / TODO
+- Implement `countActiveRuns` method using Conductor's APIs for accurate concurrency checks.
+- Add authentication and namespace-based RBAC.
+- Add more robust error handling, retry/backoff and circuit breaker.
+- Add unit/integration tests.
+
+
+// End of project files
+
